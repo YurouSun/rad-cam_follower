@@ -1,0 +1,15 @@
+# Python 相关
+__pycache__/
+*.py[cod]
+
+# ROS2 相关 (如果你在用ROS2)
+build/
+install/
+log/
+
+# 其他临时文件
+.vscode/
+*.log
+core
+core.*
+.vscode/

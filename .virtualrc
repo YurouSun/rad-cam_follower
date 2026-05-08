@@ -1,0 +1,25 @@
+#!/bin/bash
+
+source $HOME/ros2_ws/.typerc
+
+export working_space=/home/ubuntu
+export need_compile=False
+
+# colcon_cd
+export _colcon_cd_root=$working_space/ros2_ws
+export RCUTILS_COLORIZED_OUTPUT=1
+source /usr/share/colcon_cd/function/colcon_cd.sh
+
+if [ $ZSH_VERSION ]; then
+  unset AMENT_CURRENT_PREFIX COLCON_CURRENT_PREFIX
+  . /opt/ros/humble/setup.sh
+  . $working_space/ros2_ws/install/setup.zsh
+elif [ $BASH_VERSION ]; then
+  unset AMENT_CURRENT_PREFIX COLCON_CURRENT_PREFIX
+  . /opt/ros/humble/setup.sh
+  . $working_space/ros2_ws/install/setup.bash
+else
+  unset AMENT_CURRENT_PREFIX COLCON_CURRENT_PREFIX
+  . /opt/ros/humble/setup.sh
+  . $working_space/ros2_ws/install/setup.sh
+fi
