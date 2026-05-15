@@ -19,6 +19,7 @@ from std_srvs.srv import Trigger
 from sensor_msgs.msg import Imu, Joy
 from std_msgs.msg import UInt16, Bool, String
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from ros_robot_controller.ros_robot_controller_sdk import Board, PacketReportKeyEvents
 from ros_robot_controller_msgs.srv import GetBusServoState, GetPWMServoState
 from ros_robot_controller_msgs.msg import (
@@ -107,6 +108,14 @@ class RosRobotController(Node):
         self.declare_parameter('enable_cmd_vel', True)
         self.declare_parameter('cmd_vel_topic', '/tracker/cmd_vel')
         self.declare_parameter('allow_direct_set_motor', False)
+        self.declare_parameter('odom_topic', '/car3/odom')
+        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('publish_odom', True)
+        self.declare_parameter('odom_publish_rate', 20.0)
+        # SDK 协议为三通道: [0]=wz, [1]=vx, [2]=vy
+        # 保留开关参数仅用于兼容旧配置，但当前实现固定使用三通道。
+        self.declare_parameter('mecanum_enable', False)
         # 诊断开关：用于严格验证 tracker -> node -> sdk 是否一致
         self.declare_parameter('cmd_passthrough_mode', False)
         self.declare_parameter('cmd_trace_log', True)
@@ -125,6 +134,15 @@ class RosRobotController(Node):
         self.last_cmd = (0.0, 0.0, 0.0)
         self.last_cmd_time = 0.0
         self.last_cmd_valid = False
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.odom_yaw = 0.0
+        self.last_odom_time = time.time()
+        self.odom_topic = str(self.get_parameter('odom_topic').value)
+        self.odom_frame = str(self.get_parameter('odom_frame').value)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.publish_odom = bool(self.get_parameter('publish_odom').value)
+        self.odom_pub = self.create_publisher(Odometry, self.odom_topic, 10) if self.publish_odom else None
 
         self.load_servo_offsets()
 
@@ -136,6 +154,9 @@ class RosRobotController(Node):
         resend_period = float(self.get_parameter('cmd_resend_period_sec').value)
         if resend_period > 0.0:
             self.create_timer(resend_period, self.resend_last_cmd)
+        odom_rate = float(self.get_parameter('odom_publish_rate').value)
+        if self.publish_odom and odom_rate > 0.0:
+            self.create_timer(1.0 / odom_rate, self.publish_odom_state)
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
 
@@ -211,6 +232,7 @@ class RosRobotController(Node):
         if self.board is None:
             return
 
+        # SDK 固定三通道协议：0=角速度，1=X线速度，2=Y线速度
         self.board.set_motor_speed([[0, wz], [1, vx], [2, vy]])
 
         trace = getattr(self.board, 'last_motor_trace', None)
@@ -327,7 +349,7 @@ class RosRobotController(Node):
             msg = Imu()
             msg.header.frame_id = self.IMU_FRAME
             msg.header.stamp = self.clock.now().to_msg()
-            msg.orientation.w = 0.0
+            msg.orientation.w = 1.0
             msg.linear_acceleration.x = ax * self.gravity
             msg.linear_acceleration.y = ay * self.gravity
             msg.linear_acceleration.z = az * self.gravity
@@ -350,6 +372,34 @@ class RosRobotController(Node):
         if (now - self.last_cmd_time) >= timeout_sec:
             vx, vy, wz = self.last_cmd
             self._send_motor_speed(vx, vy, wz, source='resend')
+
+    def publish_odom_state(self):
+        if not self.publish_odom or self.odom_pub is None:
+            return
+        now = time.time()
+        dt = max(0.001, min(0.1, now - self.last_odom_time))
+        self.last_odom_time = now
+
+        vx, vy, wz = self.last_cmd if self.last_cmd_valid else (0.0, 0.0, 0.0)
+        self.odom_yaw += wz * dt
+        cos_yaw = math.cos(self.odom_yaw)
+        sin_yaw = math.sin(self.odom_yaw)
+        self.odom_x += (vx * cos_yaw - vy * sin_yaw) * dt
+        self.odom_y += (vx * sin_yaw + vy * cos_yaw) * dt
+
+        msg = Odometry()
+        msg.header.stamp = self.clock.now().to_msg()
+        msg.header.frame_id = self.odom_frame
+        msg.child_frame_id = self.base_frame
+        msg.pose.pose.position.x = self.odom_x
+        msg.pose.pose.position.y = self.odom_y
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation.z = math.sin(self.odom_yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(self.odom_yaw / 2.0)
+        msg.twist.twist.linear.x = vx
+        msg.twist.twist.linear.y = vy
+        msg.twist.twist.angular.z = wz
+        self.odom_pub.publish(msg)
 
     def cmd_vel_callback(self, msg): #小车运动控制回调 重要。
         """

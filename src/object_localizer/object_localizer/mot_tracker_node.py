@@ -39,6 +39,64 @@ COLOR_CONFIG = {
 
 # --- 工具函数 ---
 
+def get_color_from_class_name(class_name: str):
+    if not class_name:
+        return None
+    cls_upper = str(class_name).upper()
+    for color_name in COLOR_CONFIG.keys():
+        if color_name in cls_upper:
+            return color_name
+    return None
+
+def detect_color_tag_bgr(image_bgr, bbox):
+    # 本节点兜底颜色识别：仅在 YOLO 未带颜色标签时触发
+    try:
+        if image_bgr is None:
+            return None
+        x1, y1, x2, y2 = map(int, bbox)
+        w_box, h_box = x2 - x1, y2 - y1
+        if w_box < 10 or h_box < 10:
+            return None
+
+        cx = x1 + w_box // 2
+        w_crop = int(w_box * 0.3)
+        x1_c = max(0, cx - w_crop // 2)
+        y1_c = max(0, int(y1 + h_box * 0.10))
+        x2_c = min(image_bgr.shape[1], x1_c + w_crop)
+        y2_c = min(image_bgr.shape[0], int(y2 - h_box * 0.05))
+
+        roi = image_bgr[y1_c:y2_c, x1_c:x2_c]
+        if roi.size == 0:
+            return None
+        if roi.shape[0] > 64 or roi.shape[1] > 64:
+            roi = cv2.resize(roi, (64, 64), interpolation=cv2.INTER_NEAREST)
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        v = clahe.apply(v)
+        hsv = cv2.merge((h, s, v))
+
+        lower_red1 = np.array([0, 70, 35]); upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 70, 35]); upper_red2 = np.array([180, 255, 255])
+        lower_blue = np.array([100, 70, 35]); upper_blue = np.array([130, 255, 255])
+        lower_yellow = np.array([20, 60, 35]); upper_yellow = np.array([35, 255, 255])
+
+        total = roi.shape[0] * roi.shape[1]
+        thresh = max(8, total * 0.08)
+        c_red = cv2.countNonZero(cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2)))
+        if c_red > thresh:
+            return 'RED'
+        c_blue = cv2.countNonZero(cv2.inRange(hsv, lower_blue, upper_blue))
+        if c_blue > thresh:
+            return 'BLUE'
+        c_yellow = cv2.countNonZero(cv2.inRange(hsv, lower_yellow, upper_yellow))
+        if c_yellow > thresh:
+            return 'YELLOW'
+        return None
+    except Exception:
+        return None
+
 def iou_batch(bboxes1, bboxes2):
     bboxes2 = np.expand_dims(bboxes2, 0)
     bboxes1 = np.expand_dims(bboxes1, 1)
@@ -208,9 +266,9 @@ class KalmanBoxTracker(object):
         self.time_since_update = 0
         self.hits += 1; self.hit_streak += 1
         
-        # 【修改点】：增加名字抗抖动机制
-        is_colored_update = any(c in cls_name for c in COLOR_CONFIG.keys())
-        is_self_colored = any(c in self.cls_name for c in COLOR_CONFIG.keys())
+        #名字抗抖动机制
+        is_colored_update = get_color_from_class_name(cls_name) is not None
+        is_self_colored = get_color_from_class_name(self.cls_name) is not None
 
         if is_colored_update:
             # 如果新来的是带颜色的，且自己之前没颜色，或者自己已经Lost了很久，接受新名字
@@ -300,11 +358,7 @@ class OCSortTracker:
         matched_trk_indices = set() 
         
         for d_idx, d in enumerate(dets_high):
-            detected_color = None
-            for color_name in COLOR_CONFIG.keys():
-                if color_name in d['class']:
-                    detected_color = color_name
-                    break
+            detected_color = get_color_from_class_name(d['class'])
             
             if detected_color:
                 target_id = COLOR_CONFIG[detected_color]['id']
@@ -335,11 +389,14 @@ class OCSortTracker:
                     # 避免同一强制ID并存多条轨迹（Active/Lost各一条）
                     is_id_exists = any(t.id == target_id for t in self.tracks)
                     if not is_id_exists:
-                        new_trk = KalmanBoxTracker(d['bbox'], d['class'], d['score'], d['feat'], forced_id=target_id)
-                        new_trk.depth_dist = d.get('depth', None)
-                        new_trk.pos_3d = d.get('pos_3d', None)
-                        self.tracks.append(new_trk)
-                        matched_det_indices.add(d_idx)
+                        # 【核心修复】：在此处增加 max_track_count 限制！
+                        # 如果设为 <= 0，代表不限制数量；否则当前追踪数量必须小于最大值
+                        if self.max_track_count <= 0 or len(self.tracks) < self.max_track_count:
+                            new_trk = KalmanBoxTracker(d['bbox'], d['class'], d['score'], d['feat'], forced_id=target_id)
+                            new_trk.depth_dist = d.get('depth', None)
+                            new_trk.pos_3d = d.get('pos_3d', None)
+                            self.tracks.append(new_trk)
+                            matched_det_indices.add(d_idx)
                     
         # ---------------------------------------------------------
         #   阶段 2: 常规匈牙利匹配 (处理被拒绝的和无颜色的)
@@ -576,11 +633,18 @@ class MOTTrackerNode(Node):
                         z = depth_val; x = (u - cx) * z / fx; y = (v - cy) * z / fy
                         pos_3d_val = (x, z, y)
 
-            # YOLO 节点已经包含了 _RED 或 _BLUE，这里直接用就行
+            # 优先使用 YOLO 提供的颜色标签；若没有则在本节点做兜底识别
             class_name = obj.class_name
+            detected_color = get_color_from_class_name(class_name)
+            if detected_color is None and use_image and score >= 0.3:
+                fallback_color = detect_color_tag_bgr(curr_img, bbox)
+                if fallback_color is not None:
+                    class_name = f"{class_name}_{fallback_color}"
+                    detected_color = fallback_color
 
             det = {'bbox': bbox, 'score': score, 'class': class_name, 'feat': feat, 'depth': depth_val, 'pos_3d': pos_3d_val}
-            if score >= 0.5: dets_high.append(det)
+            # 带颜色标签的目标允许更低阈值进入第一阶段，避免可见标签但拿不到绑定ID
+            if score >= 0.5 or (detected_color is not None and score >= 0.3): dets_high.append(det)
             elif score >= 0.1: dets_low.append(det)
         
         tracked_objects, is_moving, closed_mode = self.tracker.update(dets_high, dets_low, curr_frame=curr_img, dt=dt)
@@ -620,9 +684,10 @@ class MOTTrackerNode(Node):
             debug_log.append(log_tag)
             
             color = (0, 255, 0)
-            if "RED" in tr.cls_name: color = (0, 0, 255)
-            elif "BLUE" in tr.cls_name: color = (255, 0, 0)
-            elif "YELLOW" in tr.cls_name: color = (0, 255, 255)
+            cls_color = get_color_from_class_name(tr.cls_name)
+            if cls_color == "RED": color = (0, 0, 255)
+            elif cls_color == "BLUE": color = (255, 0, 0)
+            elif cls_color == "YELLOW": color = (0, 255, 255)
             
             if tr.state == 2: thickness = 1; color = (color[0]//2, color[1]//2, color[2]//2)
             else: thickness = 2

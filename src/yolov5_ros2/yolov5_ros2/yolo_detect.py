@@ -33,6 +33,18 @@ ros_distribution = os.environ.get("ROS_DISTRO")
 package_share_directory = get_package_share_directory('yolov5_ros2')
 
 # --- 颜色标签识别工具函数 (优化版) ---
+def _enhance_dark_roi_for_color(roi_rgb):
+    # 暗光下先拉高局部亮度，减少颜色标签被阈值误杀
+    if roi_rgb is None or roi_rgb.size == 0:
+        return None
+    if roi_rgb.shape[0] > 64 or roi_rgb.shape[1] > 64:
+        roi_rgb = cv2.resize(roi_rgb, (64, 64), interpolation=cv2.INTER_NEAREST)
+    hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    v = clahe.apply(v)
+    return cv2.merge((h, s, v))
+
 def detect_color_tag(image_rgb, bbox):
     try:
         if image_rgb is None: return None
@@ -52,25 +64,22 @@ def detect_color_tag(image_rgb, bbox):
         y2_c = min(image_rgb.shape[0], int(y2 - h_box * 0.05))
         center_roi = image_rgb[y1_c:y2_c, x1_c:x2_c]
         if center_roi.size == 0: return None
-        
-        # [优化] 如果 ROI 依然很大 (>64x64)，强制缩小以加速 HSV 转换
-        if center_roi.shape[0] > 64 or center_roi.shape[1] > 64:
-            center_roi = cv2.resize(center_roi, (64, 64), interpolation=cv2.INTER_NEAREST)
-        
-        hsv = cv2.cvtColor(center_roi, cv2.COLOR_RGB2HSV)
+        hsv = _enhance_dark_roi_for_color(center_roi)
+        if hsv is None:
+            return None
         
         # 阈值
-        lower_red1 = np.array([0, 100, 80]); upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 100, 80]); upper_red2 = np.array([180, 255, 255])
-        lower_blue = np.array([100, 120, 70]); upper_blue = np.array([130, 255, 255])
-        lower_yellow = np.array([20, 100, 100]); upper_yellow = np.array([35, 255, 255])
+        lower_red1 = np.array([0, 70, 35]); upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 70, 35]); upper_red2 = np.array([180, 255, 255])
+        lower_blue = np.array([100, 70, 35]); upper_blue = np.array([130, 255, 255])
+        lower_yellow = np.array([20, 60, 35]); upper_yellow = np.array([35, 255, 255])
         
         # 红色检测
         mask_red = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
         c_red = cv2.countNonZero(mask_red)
         
-        total = center_roi.shape[0] * center_roi.shape[1]
-        thresh = total * 0.15 
+        total = hsv.shape[0] * hsv.shape[1]
+        thresh = max(8, total * 0.08)
         
         if c_red > thresh: return "RED"
         
