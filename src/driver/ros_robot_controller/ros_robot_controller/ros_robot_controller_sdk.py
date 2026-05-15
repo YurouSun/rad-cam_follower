@@ -809,7 +809,7 @@ if __name__ == "__main__":
     #board.set_rgb([[2, 255, 0, 0],[1,255,0,0]])
     #time.sleep(0.5)
     #board.set_rgb([[1, 0, 255, 0]])
-    board.set_motor_speed([[0, 0], [1, 1], [2, 0]])  # 分别是角速度，X速度，Y速度
+    board.set_motor_speed([[0, 0], [1, 1], [2, 1]])  # 分别是角速度，X速度，Y速度
     #time.sleep(1)
     #board.set_motor_speed([[1, 0], [2, 0], [3, 0], [4, 0]])
     

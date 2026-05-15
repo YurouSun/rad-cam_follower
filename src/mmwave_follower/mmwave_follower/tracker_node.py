@@ -9,6 +9,8 @@ import math
 import struct
 import time
 import numpy as np
+#修改单独跟踪  稳定  需要启动控制节点
+
 
 class MmwaveTrackerNode(Node):
     def __init__(self):
@@ -75,9 +77,13 @@ class MmwaveTrackerNode(Node):
         # 关闭直连底盘，必须通过 /controller/cmd_vel 通信
         self.declare_parameter('use_direct_board', False)
 
+        #计数器
+        self.miss_frame_count = 0
+        self.max_miss_tolerance = 10
+
         # 滤波系数
-        self.filter_alpha_coord = 0.6 
-        self.filter_alpha_cmd = 0.95
+        self.filter_alpha_coord = 0.25 #  0.15 ~ 0.3 之间，越小越平滑但会有延迟
+        self.filter_alpha_cmd = 0.3
 
         # --- 2. 订阅与发布 ---
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -173,11 +179,36 @@ class MmwaveTrackerNode(Node):
                 target_obj = candidates[0]
                 self.locked_id = target_obj['id']
 
+
         if target_obj is None:
-            if not self.is_lost:
-                self.is_lost = True
-            self.stop_robot()
+            self.miss_frame_count += 1
+            if self.miss_frame_count > self.max_miss_tolerance:
+                # 真正丢失超过 0.5 秒，才执行刹车
+                if not self.is_lost:
+                    self.get_logger().warn("目标丢失超过容忍时间，执行停车！")
+                    self.is_lost = True
+                self.stop_robot()
+            else:
+                # 只是短暂丢帧，让小车依靠惯性滑行 (速度缓慢衰减)
+                self.cmd_vx *= 0.85
+                self.cmd_vy *= 0.85
+                self.cmd_wz *= 0.85
+                
+                # 组装滑行 Twist 消息并发布
+                msg = Twist()
+                rev_x = self.get_parameter('reverse_cmd_x').value
+                rev_y = self.get_parameter('reverse_cmd_y').value
+                rev_z = self.get_parameter('reverse_cmd_z').value
+                msg.linear.x = -float(self.cmd_vx) if rev_x else float(self.cmd_vx)
+                msg.linear.y = -float(self.cmd_vy) if rev_y else float(self.cmd_vy)
+                msg.angular.z = -float(self.cmd_wz) if rev_z else float(self.cmd_wz)
+                self.pub_cmd_vel.publish(msg)
             return
+
+        # 如果找到了目标，重置丢失计数器
+        self.miss_frame_count = 0
+        self.is_lost = False
+        # ----------------------------------------------------
 
         self.is_lost = False
         
@@ -307,9 +338,12 @@ class MmwaveTrackerNode(Node):
             self.cmd_vy = 0.0
             self.cmd_wz = tgt_wz
         else:
-            max_dvx = 20.0 * dt
-            max_dvy = 20.0 * dt
-            max_dwz = 1.5 * dt
+            max_accel_x = 1.5 
+            max_accel_y = 1.5
+            max_accel_w = 2.0
+            max_dvx = max_accel_x * dt
+            max_dvy = max_accel_y * dt
+            max_dwz = max_accel_w * dt
             tgt_vx = self.cmd_vx + max(-max_dvx, min(max_dvx, tgt_vx - self.cmd_vx))
             tgt_vy = self.cmd_vy + max(-max_dvy, min(max_dvy, tgt_vy - self.cmd_vy))
             tgt_wz = self.cmd_wz + max(-max_dwz, min(max_dwz, tgt_wz - self.cmd_wz))
