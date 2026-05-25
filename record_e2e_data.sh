@@ -16,7 +16,7 @@ TOPICS=(
 "/car3/cmd_vel"
 "/controller/motor_tx"
 "/car3/ros_robot_controller/imu_raw"
-"/odom"
+"/car3/odom"
 "/tf"
 "/tf_static"
 "/tracked_objects_3d"

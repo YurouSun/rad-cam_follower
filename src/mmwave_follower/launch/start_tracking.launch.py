@@ -1,10 +1,12 @@
+import glob
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.actions import ExecuteProcess
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
-import os
 
 def generate_launch_description():
     """
@@ -32,8 +34,8 @@ def generate_launch_description():
     # 参数1: 底盘串口设备号
     device_name_arg = DeclareLaunchArgument(
         'device_name',
-        default_value='/dev/ttyACM0',
-        description='Serial port for robot controller'
+        default_value=EnvironmentVariable('ROBOT_CONTROLLER_DEVICE', default_value='/dev/ttyACM1'),
+        description='Serial port for robot controller; prefer /dev/serial/by-id/...'
     )
 
     # 参数2: 跟踪目标 ID
@@ -103,25 +105,44 @@ def generate_launch_description():
         output='screen'
     )
 
-    # (D) 机器人底盘控制器
-    # 负责接收 cmd_vel 并驱动电机
-    robot_controller_node = Node(
-        package='ros_robot_controller',
-        executable='ros_robot_controller',
-        name='ros_robot_controller',
-        namespace='car3',
-        output='screen',
-        parameters=[{
-            'device_name': LaunchConfiguration('device_name'),
-            'cmd_vel_topic': '/car3/cmd_vel',
-            'x_only_mode': False,
-            'cmd_passthrough_mode': True,
-            'sdk_debug': True,
-            'imu_frame': 'imu_link',
-            'vel_scale': 1.0, # 速度比例，视底盘具体情况调整
-            'max_v': 1.0
-        }]
-    )
+    def launch_robot_controller(context, *args, **kwargs):
+        raw_device_name = LaunchConfiguration('device_name').perform(context).strip()
+        if not raw_device_name:
+            raise RuntimeError('device_name is empty; set it to a valid /dev/serial/by-id/... or /dev/ttyACM*/ttyUSB* path')
+
+        if not os.path.exists(raw_device_name):
+            available_serial_devices = sorted(glob.glob('/dev/serial/by-id/*')) + sorted(glob.glob('/dev/ttyACM*')) + sorted(glob.glob('/dev/ttyUSB*'))
+            raise RuntimeError(
+                f'Robot controller device {raw_device_name} does not exist. '
+                f'Available serial devices: {available_serial_devices}'
+            )
+
+        selected_device_name = raw_device_name
+        if not raw_device_name.startswith('/dev/serial/by-id/'):
+            resolved_device = os.path.realpath(raw_device_name)
+            by_id_candidates = [path for path in sorted(glob.glob('/dev/serial/by-id/*')) if os.path.realpath(path) == resolved_device]
+            if by_id_candidates:
+                selected_device_name = by_id_candidates[0]
+
+        robot_controller_node = Node(
+            package='ros_robot_controller',
+            executable='ros_robot_controller',
+            name='ros_robot_controller',
+            namespace='car3',
+            output='screen',
+            parameters=[{
+                'device_name': selected_device_name,
+                'cmd_vel_topic': '/car3/cmd_vel',
+                'x_only_mode': False,
+                'cmd_passthrough_mode': True,
+                'sdk_debug': True,
+                'imu_frame': 'imu_link',
+                'vel_scale': 1.0, # 速度比例，视底盘具体情况调整
+                'max_v': 1.0
+            }]
+        )
+
+        return [robot_controller_node]
 
     # --- 4. 返回描述 ---
     return LaunchDescription([
@@ -131,5 +152,5 @@ def generate_launch_description():
         mmwave_driver_node,
         fusion_node,
         tracker_node,
-        robot_controller_node
+        OpaqueFunction(function=launch_robot_controller)
     ])
