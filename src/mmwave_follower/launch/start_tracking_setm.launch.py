@@ -74,7 +74,7 @@ def generate_launch_description():
             # [关键] 将 Launch 参数映射到节点参数
             'target_id': LaunchConfiguration('target_id'),
             'tracked_objects_topic': '/tracked_objects_3d',
-            'cmd_vel_topic': '/car3/cmd_vel',
+            'cmd_vel_topic': '/car2/cmd_vel_raw',
             
             # [关键修正] 方向控制：取消反向，约定 x 向前为正
             'reverse_cmd_x': False, 
@@ -110,6 +110,34 @@ def generate_launch_description():
             '--ros-args '
             '-p publish_topic:=/tracked_objects_3d '
             '-p det_timeout_sec:=0.8'
+        ],
+        output='screen'
+    )
+
+
+    # (SETM) 事件触发命令门控节点
+    # 订阅 tracker_node 的 /car3/cmd_vel_raw，
+    # 根据 /tracked_objects_3d 中的误差 z 判断是否允许更新 /car3/cmd_vel。
+    setm_gate_node = ExecuteProcess(
+        cmd=[
+            'bash',
+            '-lc',
+            'source /opt/ros/humble/setup.bash && '
+            'source /home/ubuntu/ros2_ws/install/setup.bash && '
+            'python3 /home/ubuntu/ros2_ws/src/mmwave_follower/mmwave_follower/car2_setm_cmd_gate_node.py '
+            '--ros-args '
+            '-p target_id:=1 '
+            '-p tracked_objects_topic:=/tracked_objects_3d '
+            '-p raw_cmd_topic:=/car3/cmd_vel_raw '
+            '-p cmd_topic:=/car3/cmd_vel '
+            '-p keep_distance:=0.50 '
+            '-p delta_far:=0.05 '
+            '-p delta_near:=0.25 '
+            '-p epsilon_z:=0.12 '
+            '-p rho:=0.0004 '
+            '-p max_hold_sec:=0.35 '
+            '-p enable_csv_log:=true '
+            '-p csv_path:=/tmp/car2_setm_gate_log.csv'
         ],
         output='screen'
     )
@@ -161,5 +189,6 @@ def generate_launch_description():
         mmwave_driver_node,
         fusion_node,
         tracker_node,
+        setm_gate_node,
         OpaqueFunction(function=launch_robot_controller)
     ])

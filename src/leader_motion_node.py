@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rcl_interfaces.msg import ParameterDescriptor
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
 
@@ -28,10 +29,66 @@ except ImportError as e:
 
 Segment = Tuple[float, float, float, float]
 
+
+ROUTE_PROFILES = {
+    "default": {"vx_forward": 0.30, "vy_lateral": 0.30, "loop": True, "max_record_time_sec": 300.0},
+    "straight": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 8.0},
+    "lateral_right": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 15.0},
+    "lateral_left": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 15.0},
+    "diagonal_right_front": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 15.0},
+    "diagonal_left_front": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 15.0},
+    "backward_straight": {"vx_forward": 0.24, "vy_lateral": 0.20, "loop": True, "max_record_time_sec": 10.0},
+    "backward_diagonal_right": {"vx_forward": 0.24, "vy_lateral": 0.20, "loop": True, "max_record_time_sec": 12.0},
+    "backward_diagonal_left": {"vx_forward": 0.24, "vy_lateral": 0.20, "loop": True, "max_record_time_sec": 12.0},
+    "stop_pause": {"vx_forward": 0.25, "vy_lateral": 0.20, "loop": True, "max_record_time_sec": 6.0},
+    "rectangle": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 22.0},
+    "sine_swerve": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 22.0},
+    "circle_sweep": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 24.0},
+    "record_easy": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": False, "max_record_time_sec": 35.0},
+    "record_zigzag": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": False, "max_record_time_sec": 45.0},
+    "record_recovery": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": False, "max_record_time_sec": 32.0},
+    "record_curve": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": False, "max_record_time_sec": 50.0},
+    "record_full": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": False, "max_record_time_sec": 110.0},
+    "record_long": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": False, "max_record_time_sec": 180.0},
+    "random_mix": {"vx_forward": 0.30, "vy_lateral": 0.28, "loop": True, "max_record_time_sec": 300.0},
+    "record_random": {"vx_forward": 0.28, "vy_lateral": 0.22, "loop": True, "max_record_time_sec": 300.0},
+}
+
 def quaternion_to_yaw(q) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def make_segment(duration: float, vx: float, vy: float) -> Segment:
+    return (float(duration), float(vx), float(vy), 0.0)
+
+
+def clone_route(
+    routes: Dict[str, List[Segment]],
+    route_name: str,
+    duration_scale: float = 1.0,
+    vx_scale: float = 1.0,
+    vy_scale: float = 1.0,
+) -> List[Segment]:
+    return [
+        (duration * duration_scale, cmd_vx * vx_scale, cmd_vy * vy_scale, wz)
+        for duration, cmd_vx, cmd_vy, wz in routes[route_name]
+    ]
+
+
+def append_route(
+    dst: List[Segment],
+    routes: Dict[str, List[Segment]],
+    route_name: str,
+    pause_sec: float = 0.7,
+    duration_scale: float = 1.0,
+    vx_scale: float = 1.0,
+    vy_scale: float = 1.0,
+) -> None:
+    dst.extend(clone_route(routes, route_name, duration_scale, vx_scale, vy_scale))
+    if pause_sec > 0.0:
+        dst.append(make_segment(pause_sec, 0.0, 0.0))
 
 def build_routes(vx_forward: float, vy_lateral: float) -> Dict[str, List[Segment]]:
     vx, vy = float(vx_forward), float(vy_lateral)
@@ -61,18 +118,146 @@ def build_routes(vx_forward: float, vy_lateral: float) -> Dict[str, List[Segment
         ],
     }
     # 恒定前向动力 S 型平移 (带【左侧非对称补偿】)
-    # 因为很多底盘在左前向滑移时摩擦力极大，导致动力相互抵消而卡死，所以针对负的 vy 给更大的驱动系数
+    # 为了更容易越过 follower 的运动死区，这里把前向速度再压低一点，
+    # 同时明显放大横向摆动幅度，并把周期拉长，形成更大的实际弧线位移。
     routes["sine_swerve"] = [
-        (0.1, 
-         0.5 * vx,  # 💡秘诀：把向前的速度减半，给横向平移留出更多展现空间，S 形的兜圈弧度就会变得非常深和明显
-         # 当计算出需要向左走(sin<0)时，给予 2.8倍 的动力补偿；向右走时保持 1.5倍
-         vy * (1.5 if math.sin(i * 0.1 * (math.pi / 4.0)) >= 0 else 2.8) * math.sin(i * 0.1 * (math.pi / 4.0)), 
-         0.0) 
-        for i in range(80) # 80 * 0.1 = 8秒刚好是一个完整的大 S 形周期
+        (
+            0.1,
+            0.22 * vx,
+            # tanh 会把峰值“压平”，让车在左右两侧停留更久，不会刚检测到就回摆。
+            vy
+            * (2.8 if math.sin(i * 0.1 * (math.pi / 7.0)) >= 0 else 4.4)
+            * math.tanh(1.8 * math.sin(i * 0.1 * (math.pi / 7.0))),
+            0.0,
+        )
+        for i in range(140)  # 14 秒完整大 S，横向拉开更慢更深
     ]
     # 环绕扫射平移 (大圆弧)
-    routes["circle_sweep"] = [(0.1, vx * 2.5 * math.sin((i * 0.1) * (math.pi / 10.0)), vy * 1.5 * math.cos((i * 0.1) * (math.pi / 10.0)), 0.0) for i in range(100)]
+    # 拉长周期并增大横向半径，让 follower 能更早感知到偏移。
+    routes["circle_sweep"] = [
+        (
+            0.1,
+            vx * (0.28 + 0.16 * math.sin((i * 0.1) * (math.pi / 8.0))),
+            vy * 2.8 * math.tanh(1.6 * math.cos((i * 0.1) * (math.pi / 8.0))),
+            0.0,
+        )
+        for i in range(160)
+    ]
+
+    # ---- 下面这些是“可以直接录制”的完整路线，不需要再靠基础动作手动拼 ----
+    routes["record_easy"] = [
+        make_segment(2.0, +0.65 * vx, 0.0),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(3.8, +0.45 * vx, -1.10 * vy),
+        make_segment(1.2, 0.0, -0.95 * vy),
+        make_segment(0.7, 0.0, 0.0),
+        make_segment(4.2, 0.0, -1.30 * vy),
+        make_segment(1.0, 0.0, 0.0),
+        make_segment(3.8, +0.45 * vx, +1.10 * vy),
+        make_segment(1.2, 0.0, +0.95 * vy),
+        make_segment(0.7, 0.0, 0.0),
+        make_segment(4.2, 0.0, +1.30 * vy),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(2.0, +0.65 * vx, 0.0),
+        make_segment(1.2, 0.0, 0.0),
+    ]
+
+    routes["record_zigzag"] = [
+        make_segment(4.0, +0.40 * vx, -1.20 * vy),
+        make_segment(1.0, 0.0, -1.00 * vy),
+        make_segment(0.7, 0.0, 0.0),
+        make_segment(4.0, +0.40 * vx, +1.20 * vy),
+        make_segment(1.0, 0.0, +1.00 * vy),
+        make_segment(0.7, 0.0, 0.0),
+        make_segment(4.0, +0.40 * vx, -1.20 * vy),
+        make_segment(1.0, 0.0, -1.00 * vy),
+        make_segment(0.7, 0.0, 0.0),
+        make_segment(4.0, +0.40 * vx, +1.20 * vy),
+        make_segment(1.0, 0.0, +1.00 * vy),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(3.6, 0.0, -1.30 * vy),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(3.6, 0.0, +1.30 * vy),
+        make_segment(1.2, 0.0, 0.0),
+    ]
+
+    routes["record_recovery"] = [
+        make_segment(1.8, +0.65 * vx, 0.0),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(3.4, -0.42 * vx, -1.10 * vy),
+        make_segment(1.0, 0.0, -0.95 * vy),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(2.0, +0.55 * vx, 0.0),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(3.4, -0.42 * vx, +1.10 * vy),
+        make_segment(1.0, 0.0, +0.95 * vy),
+        make_segment(0.8, 0.0, 0.0),
+        make_segment(2.0, +0.55 * vx, 0.0),
+        make_segment(0.6, 0.0, 0.0),
+        make_segment(1.6, -0.70 * vx, 0.0),
+        make_segment(1.2, 0.0, 0.0),
+    ]
+
+    record_curve = []
+    append_route(record_curve, routes, "sine_swerve", pause_sec=1.0, duration_scale=1.0, vx_scale=1.0, vy_scale=1.0)
+    append_route(record_curve, routes, "circle_sweep", pause_sec=1.0, duration_scale=1.0, vx_scale=0.95, vy_scale=1.0)
+    record_curve.extend(
+        [
+            make_segment(3.8, +0.35 * vx, -1.20 * vy),
+            make_segment(1.0, 0.0, -1.00 * vy),
+            make_segment(0.7, 0.0, 0.0),
+            make_segment(3.8, +0.35 * vx, +1.20 * vy),
+            make_segment(1.0, 0.0, +1.00 * vy),
+            make_segment(1.2, 0.0, 0.0),
+        ]
+    )
+    routes["record_curve"] = record_curve
+
+    record_full = []
+    append_route(record_full, routes, "record_easy", pause_sec=1.0)
+    append_route(record_full, routes, "record_zigzag", pause_sec=1.0)
+    append_route(record_full, routes, "record_recovery", pause_sec=1.0)
+    append_route(record_full, routes, "rectangle", pause_sec=0.8, duration_scale=0.8, vx_scale=0.55, vy_scale=1.20)
+    append_route(record_full, routes, "sine_swerve", pause_sec=1.0, duration_scale=1.0, vx_scale=1.0, vy_scale=1.05)
+    record_full.extend(
+        [
+            make_segment(1.8, +0.60 * vx, 0.0),
+            make_segment(0.7, 0.0, 0.0),
+            make_segment(4.0, 0.0, -1.30 * vy),
+            make_segment(1.0, 0.0, -1.05 * vy),
+            make_segment(0.7, 0.0, 0.0),
+            make_segment(4.0, 0.0, +1.30 * vy),
+            make_segment(1.0, 0.0, +1.05 * vy),
+            make_segment(1.2, 0.0, 0.0),
+        ]
+    )
+    routes["record_full"] = record_full
+
+    record_long = []
+    append_route(record_long, routes, "record_full", pause_sec=1.2)
+    append_route(record_long, routes, "record_curve", pause_sec=1.2)
+    append_route(record_long, routes, "circle_sweep", pause_sec=1.0, duration_scale=1.0, vx_scale=0.95, vy_scale=1.0)
+    record_long.extend(
+        [
+            make_segment(1.8, -0.55 * vx, 0.0),
+            make_segment(0.8, 0.0, 0.0),
+            make_segment(4.2, +0.35 * vx, -1.25 * vy),
+            make_segment(1.0, 0.0, -1.05 * vy),
+            make_segment(0.7, 0.0, 0.0),
+            make_segment(4.2, +0.35 * vx, +1.25 * vy),
+            make_segment(1.0, 0.0, +1.05 * vy),
+            make_segment(1.5, 0.0, 0.0),
+        ]
+    )
+    routes["record_long"] = record_long
+
     return routes
+
+
+def resolve_route_profile(route_name: str) -> Dict[str, float]:
+    profile = dict(ROUTE_PROFILES["default"])
+    profile.update(ROUTE_PROFILES.get(route_name, {}))
+    return profile
 
 class LeaderMotionNode(Node):
     def __init__(self) -> None:
@@ -96,7 +281,7 @@ class LeaderMotionNode(Node):
         self.declare_parameter("vx_forward", 0.3)   # 稍微提高默认速度，让动作更清晰
         self.declare_parameter("vy_lateral", 0.3)
         self.declare_parameter("loop", True) 
-        self.declare_parameter("max_record_time_sec", 300.0) 
+        self.declare_parameter("max_record_time_sec", 300.0, ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter("enable_imu_correction", True)
         self.declare_parameter("kp_yaw", 1.5)
         self.declare_parameter("max_wz", 0.5)
@@ -105,10 +290,12 @@ class LeaderMotionNode(Node):
         self.imu_topic = str(self.get_parameter("imu_topic").value)
         self.route_name = str(self.get_parameter("route_name").value)
         self.rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
-        self.vx_forward = float(self.get_parameter("vx_forward").value)
-        self.vy_lateral = float(self.get_parameter("vy_lateral").value)
-        self.loop = bool(self.get_parameter("loop").value)
-        self.max_record_time_sec = float(self.get_parameter("max_record_time_sec").value)
+        route_profile = resolve_route_profile(self.route_name)
+        parameter_overrides = getattr(self, "_parameter_overrides", {})
+        self.vx_forward = float(parameter_overrides["vx_forward"].value) if "vx_forward" in parameter_overrides else float(route_profile["vx_forward"])
+        self.vy_lateral = float(parameter_overrides["vy_lateral"].value) if "vy_lateral" in parameter_overrides else float(route_profile["vy_lateral"])
+        self.loop = bool(parameter_overrides["loop"].value) if "loop" in parameter_overrides else bool(route_profile["loop"])
+        self.max_record_time_sec = float(parameter_overrides["max_record_time_sec"].value) if "max_record_time_sec" in parameter_overrides else float(route_profile["max_record_time_sec"])
         
         self.enable_imu_correction = bool(self.get_parameter("enable_imu_correction").value)
         self.kp_yaw = float(self.get_parameter("kp_yaw").value)
@@ -118,22 +305,42 @@ class LeaderMotionNode(Node):
         self.is_yaw_locked, self.has_imu_data = False, False
         self.last_logged_segment = -1
         
-        # 将所有新加入的后退动作注册到随机抽取池中
+        # 基础动作随机池：适合做简单的 random_mix
         self.primitives = [
             "straight", "lateral_left", "lateral_right", 
             "diagonal_left_front", "diagonal_right_front", 
             "backward_straight", "backward_diagonal_right", "backward_diagonal_left",
             "sine_swerve", "circle_sweep", "stop_pause"
         ]
+        # 完整录制路线：适合直接指定 route_name 开录
+        self.record_courses = [
+            "record_easy",
+            "record_zigzag",
+            "record_recovery",
+            "record_curve",
+            "record_full",
+            "record_long",
+        ]
         
         self.pub = self.create_publisher(Twist, self.cmd_topic, 10)
         self.sub_imu = self.create_subscription(Imu, self.imu_topic, self.imu_callback, qos_profile_sensor_data)
         self.routes = build_routes(self.vx_forward, self.vy_lateral)
+        self.get_logger().info(
+            f"路线参数: route={self.route_name}, vx_forward={self.vx_forward:.2f}, "
+            f"vy_lateral={self.vy_lateral:.2f}, loop={self.loop}, max_record_time_sec={self.max_record_time_sec:.1f}"
+        )
         
         if self.route_name == "random_mix":
             self.current_route_name = random.choice(self.primitives)
+        elif self.route_name == "record_random":
+            self.current_route_name = random.choice(self.record_courses)
         else:
-            self.current_route_name = self.route_name if self.route_name in self.routes else "straight"
+            if self.route_name not in self.routes:
+                available_routes = ", ".join(sorted(self.routes.keys()) + ["record_random"])
+                self.get_logger().warn(f"未知 route_name={self.route_name}，自动切回 straight。可选路线: {available_routes}")
+                self.current_route_name = "straight"
+            else:
+                self.current_route_name = self.route_name
             
         self.segments = self.routes[self.current_route_name]
         self.segment_index = 0
@@ -186,6 +393,11 @@ class LeaderMotionNode(Node):
             if self.segment_index >= len(self.segments):
                 if self.route_name == "random_mix":
                     self.current_route_name = random.choice(self.primitives)
+                    self.segments = self.routes[self.current_route_name]
+                    self.segment_index, self.state_start_time = 0, now
+                    self.last_logged_segment = -1
+                elif self.route_name == "record_random":
+                    self.current_route_name = random.choice(self.record_courses)
                     self.segments = self.routes[self.current_route_name]
                     self.segment_index, self.state_start_time = 0, now
                     self.last_logged_segment = -1

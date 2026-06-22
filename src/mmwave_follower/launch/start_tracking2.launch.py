@@ -10,8 +10,8 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     """
-    Launch file to start the mmWave driver, the tracker node, the new fusion node, and the robot controller.
-    启动毫米波雷达驱动、跟踪节点、新版融合节点以及机器人底盘控制器的组合启动文件。
+    Launch file to start the mmWave driver, the tracker node (V6.1), and the robot controller.
+    启动毫米波雷达驱动、跟踪节点(V6.1)以及机器人底盘控制器的组合启动文件。
     """
     
     # --- 1. 配置路径 ---
@@ -63,17 +63,16 @@ def generate_launch_description():
         }]
     )
 
-    # (B) 跟踪节点
-    # 负责订阅 /tracked_objects_3d 融合结果并控制底盘运动
+    # (B) 跟踪节点 (MmwaveTrackerNode V6.1)
+    # 负责订阅融合数据并控制底盘运动
     tracker_node = Node(
         package='mmwave_follower',
-        executable='tracker_node',
-        name='tracker_node',
+        executable='tracker_node2',
+        name='tracker_node2',
         output='screen',
         parameters=[{
             # [关键] 将 Launch 参数映射到节点参数
             'target_id': LaunchConfiguration('target_id'),
-            'tracked_objects_topic': '/tracked_objects_3d',
             'cmd_vel_topic': '/car3/cmd_vel',
             
             # [关键修正] 方向控制：取消反向，约定 x 向前为正
@@ -82,35 +81,25 @@ def generate_launch_description():
 
             # 运动控制参数 (可以在这里直接修改，无需重新编译)
             'keep_distance': 0.5,  # 保持距离 0.5米
-            'kp_linear': 0.8,      # 前后跟随灵敏度
-            'kp_lateral': 1.0,     # 左右横移灵敏度
+            'kp_linear': 1.6,      # 前后跟随灵敏度 (提高灵敏度)
+            'kp_lateral': 2.0,     # 左右横移灵敏度 (提高灵敏度)
             'kp_angular': 0.0,     # 转向灵敏度（禁用）
             'lat_deadband_m': 0.05, # 侧向死带 5cm
             
-            # 安全限速
-            'max_vx': 0.4,
-            'max_vy': 0.3,         # 侧向速度限制到 0.3 m/s
-            'max_wz': 0.2          # 允许微小角速用于阻尼
-            ,
-            'yaw_damping_gain': 1.2,
-            'yaw_damping_limit': 0.2,
-            'filter_alpha_cmd': 0.6,
-            'filter_alpha_coord': 0.5
+            # 安全限速 (针对 tracker_node2.py 中的参数名进行适配)
+            'max_normal_vx': 0.9,
+            'max_fast_vx': 1.35,
+            'max_vy': 0.9,         # 侧向速度限制提高
+            
+            'filter_alpha_cmd': 0.15,   # 使用平滑版参数
+            'filter_alpha_coord': 0.15  # 使用平滑版参数
         }]
     )
 
     # (C) 雷达-相机融合节点
-    # 切换到新的 fusion.py，负责发布 /tracked_objects_3d
+    # 负责订阅 /ti_mmwave/radar_scan_pcl 和相机检测结果，发布 /tracked_objects_3d
     fusion_node = ExecuteProcess(
-        cmd=[
-            'bash',
-            '-lc',
-            'source /home/ubuntu/ros2_ws/install/setup.bash && '
-            'python3 /home/ubuntu/ros2_ws/src/fusion.py '
-            '--ros-args '
-            '-p publish_topic:=/tracked_objects_3d '
-            '-p det_timeout_sec:=0.8'
-        ],
+        cmd=['bash', '-lc', 'source /home/ubuntu/ros2_ws/install/setup.bash && python3 /home/ubuntu/ros2_ws/src/radar_camera_fusion.py'],
         output='screen'
     )
 
@@ -147,7 +136,7 @@ def generate_launch_description():
                 'sdk_debug': True,
                 'imu_frame': 'imu_link',
                 'vel_scale': 1.0, # 速度比例，视底盘具体情况调整
-                'max_v': 1.0
+                'max_v': 3.0  # [修改] 提高底层控制器最高允许速度限制，否则会被卡死在1.0以下
             }]
         )
 

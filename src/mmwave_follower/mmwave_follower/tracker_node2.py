@@ -8,18 +8,16 @@ from interfaces.msg import ObjectsInfo
 import math
 import time
 
-class MmwaveTrackerNode(Node):
+class MmwaveTrackerNode2(Node):
     def __init__(self):
-        super().__init__('tracker_node')
-        self.get_logger().info('毫米波雷达跟踪节点已启动 (V11.0 纯平移强力兜底版)')
+        super().__init__('tracker_node2')
+        self.get_logger().info('毫米波雷达跟踪节点已启动 (V12.0 平滑抗顿挫版)')
 
         # --- 1. 参数声明 ---
         self.declare_parameter('target_id', -1)
         self.declare_parameter('keep_distance', 0.5) 
         self.declare_parameter('chase_threshold', 1.2) 
-        self.declare_parameter('tracked_objects_topic', '/car3/tracked_objects_3d')
         self.declare_parameter('cmd_vel_topic', '/car3/cmd_vel')
-        self.declare_parameter('radar_tracks_topic', '/radar/tracked_targets')
         self.declare_parameter('debug_cmd_monitor', True)
         
         # 方向设置
@@ -40,9 +38,9 @@ class MmwaveTrackerNode(Node):
         self.declare_parameter('min_effective_vy', 0.30)
         
         # 速度上限
-        self.declare_parameter('max_normal_vx', 0.3) 
-        self.declare_parameter('max_fast_vx', 0.45)
-        self.declare_parameter('max_vy', 0.3)
+        self.declare_parameter('max_normal_vx', 0.9) 
+        self.declare_parameter('max_fast_vx', 1.35)
+        self.declare_parameter('max_vy', 0.9)
         
         self.declare_parameter('lat_deadband_m', 0.06)
         self.declare_parameter('integral_limit_x', 1.0)
@@ -51,20 +49,16 @@ class MmwaveTrackerNode(Node):
         # 计数器与滤波
         self.miss_frame_count = 0
         self.max_miss_tolerance = 15  # 放大容忍度到约 0.75 秒
-        self.filter_alpha_coord = 0.25
-        self.filter_alpha_cmd = 0.3
+        self.filter_alpha_coord = 0.15 # [修改] 降低坐标平滑系数，增加滤波程度
+        self.filter_alpha_cmd = 0.15   # [修改] 降低速度控制平滑系数，减缓速度剧烈跳变
 
         # --- 2. 订阅与发布 ---
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-        tracked_objects_topic = str(self.get_parameter('tracked_objects_topic').value)
-        self.sub_fusion = self.create_subscription(ObjectsInfo, tracked_objects_topic, self.fusion_callback, qos)
-        radar_tracks_topic = str(self.get_parameter('radar_tracks_topic').value)
-        self.sub_radar_track = self.create_subscription(RadarTrackArray, radar_tracks_topic, self.radar_track_callback, 10)
+        self.sub_fusion = self.create_subscription(ObjectsInfo, '/tracked_objects_3d', self.fusion_callback, qos)
+        self.sub_radar_track = self.create_subscription(RadarTrackArray, '/ti_mmwave/radar_track_array', self.radar_track_callback, 10)
         
         cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
         self.pub_cmd_vel = self.create_publisher(Twist, cmd_vel_topic, 10)
-        self.get_logger().info(f'融合目标订阅话题: {tracked_objects_topic}')
-        self.get_logger().info(f'雷达轨迹订阅话题: {radar_tracks_topic}')
 
         # --- 3. 核心状态 ---
         self.last_track_time = time.time()
@@ -89,30 +83,6 @@ class MmwaveTrackerNode(Node):
         self.locked_id = -1 
         
         self.create_timer(0.05, self.watchdog_timer_callback)
-
-    def _extract_fusion_source(self, class_name):
-        if not class_name:
-            return 'unknown'
-        if class_name.endswith('_Rad'):
-            return 'radar'
-        if class_name.endswith('_Vis'):
-            return 'visual'
-        if class_name.endswith('_Pred'):
-            return 'predict'
-        return 'unknown'
-
-    def _candidate_priority(self, candidate):
-        source_priority = {
-            'radar': 0,
-            'visual': 1,
-            'predict': 2,
-            'unknown': 3,
-        }
-        return (
-            source_priority.get(candidate.get('source', 'unknown'), 3),
-            candidate['x'],
-            abs(candidate['y']),
-        )
 
     def watchdog_timer_callback(self):
         now = time.time()
@@ -144,12 +114,7 @@ class MmwaveTrackerNode(Node):
                     tx = float(obj.position.x)
                     ty = float(obj.position.y)
                     if tx > 0:
-                        candidates.append({
-                            'id': oid,
-                            'x': tx,
-                            'y': ty,
-                            'source': self._extract_fusion_source(getattr(obj, 'class_name', '')),
-                        })
+                        candidates.append({'id': oid, 'x': tx, 'y': ty})
             except Exception:
                 continue
 
@@ -168,7 +133,7 @@ class MmwaveTrackerNode(Node):
                         found_locked = True
                         break
             if not found_locked and candidates:
-                candidates.sort(key=self._candidate_priority)
+                candidates.sort(key=lambda x: x['x'])
                 target_obj = candidates[0]
                 self.locked_id = target_obj['id']
 
@@ -189,7 +154,7 @@ class MmwaveTrackerNode(Node):
             
             if best_radar_track is not None:
                 target_obj = best_radar_track
-                self.filter_alpha_coord = 0.1 # 雷达噪点大，坐标平滑系数降到极低，防止车体发抖
+                self.filter_alpha_coord = 0.05 # [修改] 雷达噪点大，坐标平滑系数降到极低，防止车体发抖
                 self.get_logger().info("视觉丢失！纯雷达盲跟接管中！", throttle_duration_sec=1.0)
             else:
                 self.miss_frame_count += 1
@@ -199,13 +164,13 @@ class MmwaveTrackerNode(Node):
                         self.is_lost = True
                     self.stop_robot()
                 else:
-                    # 缓冲期：平移惯性衰减
-                    self.cmd_vx *= 0.85
-                    self.cmd_vy *= 0.85
+                    # [修改] 缓冲期：平移惯性衰减变得更加平缓 (0.85 -> 0.92)
+                    self.cmd_vx *= 0.92
+                    self.cmd_vy *= 0.92
                     self._publish_current_cmd()
                 return
         else:
-            self.filter_alpha_coord = 0.25 # 视觉恢复正常权重
+            self.filter_alpha_coord = 0.15 # [修改] 视觉恢复正常权重（调低）
 
         # ====================================================
 
@@ -224,12 +189,7 @@ class MmwaveTrackerNode(Node):
         self.target_x_rob = alpha * raw_x_rob + (1 - alpha) * self.target_x_rob
         self.target_y_rob = alpha * raw_y_rob + (1 - alpha) * self.target_y_rob
 
-        source_tag = target_obj.get('source', 'radar_fallback')
-        self.calculate_velocity(
-            self.target_x_rob,
-            self.target_y_rob,
-            f"{target_obj.get('id', 'RADAR')}[{source_tag}]",
-        )
+        self.calculate_velocity(self.target_x_rob, self.target_y_rob, target_obj.get('id', 'RADAR'))
 
     def _publish_current_cmd(self):
         msg = Twist()
@@ -309,8 +269,8 @@ class MmwaveTrackerNode(Node):
                 tgt_vy = math.copysign(min_effective_vy, tgt_vy)
 
         # 3. 物理加速度限幅与滤波 (纯平移)
-        max_accel_x = 1.5 
-        max_accel_y = 1.5
+        max_accel_x = 3.0 
+        max_accel_y = 3.0
         max_dvx = max_accel_x * dt
         max_dvy = max_accel_y * dt
         
@@ -345,7 +305,7 @@ class MmwaveTrackerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MmwaveTrackerNode()
+    node = MmwaveTrackerNode2()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
